@@ -1,74 +1,52 @@
 from flask import Flask, jsonify, request, send_from_directory
-import sqlite3
-import json
 import os
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
+from pymongo import MongoClient
+from bson import ObjectId
 
-app = Flask(__name__, static_folder='static', template_folder='templates')
-DB_PATH = os.path.join(os.path.dirname(__file__), 'cosmicq.db')
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+app = Flask(
+    __name__,
+    static_folder=os.path.join(_ROOT, 'static'),
+    template_folder=os.path.join(_ROOT, 'templates'),
+)
+
+# ── MongoDB connection ────────────────────────────────────────────────────────
+MONGO_URI = os.environ.get(
+    'MONGODB_URI',
+    'mongodb+srv://khetesh:cRrQuK1rg8jtlXmE@cluster0.mjow3ex.mongodb.net/?appName=Cluster0'
+)
+_client = MongoClient(MONGO_URI)
+_db     = _client['cosmicq']
+
+users_col    = _db['users']
+plans_col    = _db['plans']
+reviews_col  = _db['reviews']
+sessions_col = _db['sessions']
 
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def to_dict(doc):
+    """Convert a MongoDB document to a JSON-serialisable dict."""
+    if doc is None:
+        return None
+    d = dict(doc)
+    d['id'] = str(d.pop('_id'))
+    return d
 
 
 def init_db():
-    conn = get_db()
-    conn.executescript('''
-        CREATE TABLE IF NOT EXISTS user (
-            id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS daily_plans (
-            id INTEGER PRIMARY KEY,
-            date TEXT NOT NULL UNIQUE,
-            priorities TEXT NOT NULL,
-            deep_work_target REAL DEFAULT 4.0,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS eod_reviews (
-            id INTEGER PRIMARY KEY,
-            date TEXT NOT NULL UNIQUE,
-            deep_work_hours REAL NOT NULL,
-            priority_outcomes TEXT NOT NULL,
-            main_blocker TEXT NOT NULL,
-            tomorrow_focus TEXT NOT NULL,
-            execution_score INTEGER NOT NULL,
-            score_breakdown TEXT NOT NULL,
-            feedback TEXT NOT NULL,
-            grade TEXT NOT NULL,
-            grade_letter TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS deep_work_sessions (
-            id INTEGER PRIMARY KEY,
-            date TEXT NOT NULL,
-            focus_area TEXT NOT NULL,
-            start_time TEXT NOT NULL,
-            end_time TEXT,
-            duration_minutes INTEGER,
-            outcome TEXT DEFAULT ''
-        );
-    ''')
-    conn.commit()
-    conn.close()
+    """Create indexes (idempotent — safe to call on every boot)."""
+    plans_col.create_index('date', unique=True)
+    reviews_col.create_index('date', unique=True)
+    sessions_col.create_index('date')
 
 
 # ── USER ─────────────────────────────────────────────────────────────────────
 
 @app.route('/api/user', methods=['GET'])
 def get_user():
-    conn = get_db()
-    user = conn.execute('SELECT * FROM user ORDER BY id DESC LIMIT 1').fetchone()
-    conn.close()
-    return jsonify(dict(user) if user else None)
+    user = users_col.find_one({}, sort=[('_id', -1)])
+    return jsonify(to_dict(user))
 
 
 @app.route('/api/user', methods=['POST'])
@@ -77,77 +55,53 @@ def save_user():
     name = (data.get('name') or '').strip()
     if not name:
         return jsonify({'error': 'Name required'}), 400
-    conn = get_db()
-    conn.execute('DELETE FROM user')
-    conn.execute('INSERT INTO user (name) VALUES (?)', (name,))
-    conn.commit()
-    user = conn.execute('SELECT * FROM user ORDER BY id DESC LIMIT 1').fetchone()
-    conn.close()
-    return jsonify(dict(user))
+    users_col.delete_many({})
+    result = users_col.insert_one({'name': name, 'created_at': datetime.utcnow().isoformat()})
+    user = users_col.find_one({'_id': result.inserted_id})
+    return jsonify(to_dict(user))
 
 
 # ── DAILY PLANS ───────────────────────────────────────────────────────────────
 
 @app.route('/api/plans/<date_str>', methods=['GET'])
 def get_plan(date_str):
-    conn = get_db()
-    plan = conn.execute('SELECT * FROM daily_plans WHERE date = ?', (date_str,)).fetchone()
-    conn.close()
-    if not plan:
-        return jsonify(None)
-    p = dict(plan)
-    p['priorities'] = json.loads(p['priorities'])
-    return jsonify(p)
+    plan = plans_col.find_one({'date': date_str})
+    return jsonify(to_dict(plan))
 
 
 @app.route('/api/plans', methods=['POST'])
 def save_plan():
     data = request.json
     date_str = data.get('date', str(date.today()))
-    priorities = json.dumps(data.get('priorities', []))
+    priorities = data.get('priorities', [])
     target = float(data.get('deep_work_target', 4.0))
-    conn = get_db()
-    conn.execute('''
-        INSERT INTO daily_plans (date, priorities, deep_work_target, updated_at)
-        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(date) DO UPDATE SET
-            priorities = excluded.priorities,
-            deep_work_target = excluded.deep_work_target,
-            updated_at = CURRENT_TIMESTAMP
-    ''', (date_str, priorities, target))
-    conn.commit()
-    plan = conn.execute('SELECT * FROM daily_plans WHERE date = ?', (date_str,)).fetchone()
-    conn.close()
-    p = dict(plan)
-    p['priorities'] = json.loads(p['priorities'])
-    return jsonify(p)
+    now = datetime.utcnow().isoformat()
+    plans_col.update_one(
+        {'date': date_str},
+        {'$set':         {'priorities': priorities, 'deep_work_target': target, 'updated_at': now},
+         '$setOnInsert': {'created_at': now}},
+        upsert=True
+    )
+    plan = plans_col.find_one({'date': date_str})
+    return jsonify(to_dict(plan))
 
 
 # ── EOD REVIEWS ───────────────────────────────────────────────────────────────
 
 @app.route('/api/reviews/<date_str>', methods=['GET'])
 def get_review(date_str):
-    conn = get_db()
-    review = conn.execute('SELECT * FROM eod_reviews WHERE date = ?', (date_str,)).fetchone()
-    conn.close()
-    if not review:
-        return jsonify(None)
-    r = dict(review)
-    r['priority_outcomes'] = json.loads(r['priority_outcomes'])
-    r['score_breakdown'] = json.loads(r['score_breakdown'])
-    r['feedback'] = json.loads(r['feedback'])
-    return jsonify(r)
+    review = reviews_col.find_one({'date': date_str})
+    return jsonify(to_dict(review))
 
 
 @app.route('/api/reviews/history', methods=['GET'])
 def get_review_history():
-    conn = get_db()
-    reviews = conn.execute('''
-        SELECT date, execution_score, deep_work_hours, grade, grade_letter
-        FROM eod_reviews ORDER BY date DESC LIMIT 30
-    ''').fetchall()
-    conn.close()
-    return jsonify([dict(r) for r in reviews])
+    reviews = list(reviews_col.find(
+        {},
+        {'date': 1, 'execution_score': 1, 'deep_work_hours': 1, 'grade': 1, 'grade_letter': 1},
+        sort=[('date', -1)],
+    ).limit(30))
+    return jsonify([to_dict(r) for r in reviews])
 
 
 @app.route('/api/reviews', methods=['POST'])
@@ -161,34 +115,24 @@ def save_review():
 
     result = _calculate_score(deep_work_hours, priority_outcomes)
 
-    conn = get_db()
-    conn.execute('''
-        INSERT INTO eod_reviews
-            (date, deep_work_hours, priority_outcomes, main_blocker, tomorrow_focus,
-             execution_score, score_breakdown, feedback, grade, grade_letter)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(date) DO UPDATE SET
-            deep_work_hours = excluded.deep_work_hours,
-            priority_outcomes = excluded.priority_outcomes,
-            main_blocker = excluded.main_blocker,
-            tomorrow_focus = excluded.tomorrow_focus,
-            execution_score = excluded.execution_score,
-            score_breakdown = excluded.score_breakdown,
-            feedback = excluded.feedback,
-            grade = excluded.grade,
-            grade_letter = excluded.grade_letter
-    ''', (
-        date_str, deep_work_hours,
-        json.dumps(priority_outcomes),
-        main_blocker, tomorrow_focus,
-        result['score'],
-        json.dumps(result['breakdown']),
-        json.dumps(result['feedback']),
-        result['grade'],
-        result['grade_letter']
-    ))
-    conn.commit()
-    conn.close()
+    now = datetime.utcnow().isoformat()
+    reviews_col.update_one(
+        {'date': date_str},
+        {'$set': {
+            'deep_work_hours':  deep_work_hours,
+            'priority_outcomes': priority_outcomes,
+            'main_blocker':     main_blocker,
+            'tomorrow_focus':   tomorrow_focus,
+            'execution_score':  result['score'],
+            'score_breakdown':  result['breakdown'],
+            'feedback':         result['feedback'],
+            'grade':            result['grade'],
+            'grade_letter':     result['grade_letter'],
+            'updated_at':       now,
+        },
+         '$setOnInsert': {'created_at': now}},
+        upsert=True
+    )
     return jsonify({**data, **result})
 
 
@@ -281,83 +225,86 @@ def _calculate_score(deep_work_hours, priority_outcomes):
 @app.route('/api/sessions', methods=['GET'])
 def get_sessions():
     date_str = request.args.get('date', str(date.today()))
-    conn = get_db()
-    sessions = conn.execute(
-        'SELECT * FROM deep_work_sessions WHERE date = ? ORDER BY start_time',
-        (date_str,)
-    ).fetchall()
-    conn.close()
-    return jsonify([dict(s) for s in sessions])
+    sessions = list(sessions_col.find({'date': date_str}, sort=[('start_time', 1)]))
+    return jsonify([to_dict(s) for s in sessions])
 
 
 @app.route('/api/sessions', methods=['POST'])
 def create_session():
     data = request.json
-    conn = get_db()
-    conn.execute(
-        'INSERT INTO deep_work_sessions (date, focus_area, start_time) VALUES (?, ?, ?)',
-        (data['date'], data['focus_area'], data['start_time'])
-    )
-    conn.commit()
-    s = conn.execute('SELECT * FROM deep_work_sessions ORDER BY id DESC LIMIT 1').fetchone()
-    conn.close()
-    return jsonify(dict(s))
+    result = sessions_col.insert_one({
+        'date':       data['date'],
+        'focus_area': data['focus_area'],
+        'start_time': data['start_time'],
+        'end_time':          None,
+        'duration_minutes':  None,
+        'outcome':           '',
+    })
+    s = sessions_col.find_one({'_id': result.inserted_id})
+    return jsonify(to_dict(s))
 
 
-@app.route('/api/sessions/<int:sid>', methods=['PATCH'])
+@app.route('/api/sessions/<string:sid>', methods=['PATCH'])
 def end_session(sid):
     data = request.json
-    conn = get_db()
-    conn.execute(
-        'UPDATE deep_work_sessions SET end_time=?, duration_minutes=?, outcome=? WHERE id=?',
-        (data['end_time'], data['duration_minutes'], data.get('outcome', ''), sid)
+    sessions_col.update_one(
+        {'_id': ObjectId(sid)},
+        {'$set': {
+            'end_time':         data['end_time'],
+            'duration_minutes': data['duration_minutes'],
+            'outcome':          data.get('outcome', ''),
+        }}
     )
-    conn.commit()
-    s = conn.execute('SELECT * FROM deep_work_sessions WHERE id=?', (sid,)).fetchone()
-    conn.close()
-    return jsonify(dict(s))
+    s = sessions_col.find_one({'_id': ObjectId(sid)})
+    return jsonify(to_dict(s))
 
 
 # ── STATS ─────────────────────────────────────────────────────────────────────
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
-    conn = get_db()
+    # Recent reviews for charts
+    recent = list(reviews_col.find(
+        {},
+        {'date': 1, 'execution_score': 1, 'deep_work_hours': 1, 'grade_letter': 1},
+        sort=[('date', -1)],
+    ).limit(14))
 
-    recent = conn.execute('''
-        SELECT date, execution_score, deep_work_hours, grade_letter
-        FROM eod_reviews ORDER BY date DESC LIMIT 14
-    ''').fetchall()
-
-    all_dates = [r['date'] for r in conn.execute(
-        'SELECT date FROM eod_reviews ORDER BY date DESC'
-    ).fetchall()]
-
+    # Streak — count consecutive days backwards from today
+    all_dates = {r['date'] for r in reviews_col.find({}, {'date': 1})}
     streak = 0
     check = date.today()
-    date_set = set(all_dates)
-    while str(check) in date_set:
+    while str(check) in all_dates:
         streak += 1
         check -= timedelta(days=1)
 
-    avg_row = conn.execute('''
-        SELECT AVG(deep_work_hours) as avg_dw, AVG(execution_score) as avg_score
-        FROM eod_reviews WHERE date >= date('now', '-7 days')
-    ''').fetchone()
+    # 7-day averages
+    seven_ago = str(date.today() - timedelta(days=7))
+    avg_pipeline = [
+        {'$match': {'date': {'$gte': seven_ago}}},
+        {'$group': {'_id': None,
+                    'avg_dw':    {'$avg': '$deep_work_hours'},
+                    'avg_score': {'$avg': '$execution_score'}}},
+    ]
+    avg_result = list(reviews_col.aggregate(avg_pipeline))
+    avg_dw    = avg_result[0]['avg_dw']    if avg_result else 0
+    avg_score = avg_result[0]['avg_score'] if avg_result else 0
 
-    total_sessions = conn.execute('SELECT COUNT(*) as c FROM deep_work_sessions').fetchone()
-    total_dw = conn.execute(
-        'SELECT SUM(duration_minutes) as s FROM deep_work_sessions WHERE end_time IS NOT NULL'
-    ).fetchone()
+    # Total deep work time across all sessions
+    dw_pipeline = [
+        {'$match': {'end_time': {'$ne': None}}},
+        {'$group': {'_id': None, 'total': {'$sum': '$duration_minutes'}}},
+    ]
+    dw_result = list(sessions_col.aggregate(dw_pipeline))
+    total_dw_min = dw_result[0]['total'] if dw_result else 0
 
-    conn.close()
     return jsonify({
-        'recent_reviews': [dict(r) for r in recent],
-        'streak': streak,
-        'avg_deep_work_7d': round(avg_row['avg_dw'] or 0, 1),
-        'avg_score_7d': round(avg_row['avg_score'] or 0, 1),
-        'total_sessions': total_sessions['c'],
-        'total_dw_hours': round((total_dw['s'] or 0) / 60, 1),
+        'recent_reviews':   [to_dict(r) for r in recent],
+        'streak':           streak,
+        'avg_deep_work_7d': round(avg_dw    or 0, 1),
+        'avg_score_7d':     round(avg_score or 0, 1),
+        'total_sessions':   sessions_col.count_documents({}),
+        'total_dw_hours':   round((total_dw_min or 0) / 60, 1),
     })
 
 
@@ -373,7 +320,9 @@ def serve(path):
     return send_from_directory(app.template_folder, 'index.html')
 
 
+# Initialise DB at import time so Vercel's WSGI boot picks it up.
+init_db()
+
 if __name__ == '__main__':
-    init_db()
     print("Cosmic Q Ops running → http://localhost:5050")
     app.run(debug=True, port=5050, use_reloader=False)
