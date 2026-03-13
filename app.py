@@ -3,6 +3,7 @@ import os
 from datetime import date, timedelta, datetime
 from pymongo import MongoClient
 from bson import ObjectId
+import certifi
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 app = Flask(
@@ -16,7 +17,7 @@ MONGO_URI = os.environ.get(
     'MONGODB_URI',
     'mongodb+srv://khetesh:cRrQuK1rg8jtlXmE@cluster0.mjow3ex.mongodb.net/?appName=Cluster0'
 )
-_client = MongoClient(MONGO_URI)
+_client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
 _db     = _client['cosmicq']
 
 users_col    = _db['users']
@@ -34,11 +35,22 @@ def to_dict(doc):
     return d
 
 
+_indexes_created = False
+
 def init_db():
-    """Create indexes (idempotent — safe to call on every boot)."""
+    """Create indexes lazily on the first real request (not at import time)."""
+    global _indexes_created
+    if _indexes_created:
+        return
     plans_col.create_index('date', unique=True)
     reviews_col.create_index('date', unique=True)
     sessions_col.create_index('date')
+    _indexes_created = True
+
+
+@app.before_request
+def ensure_indexes():
+    init_db()
 
 
 # ── USER ─────────────────────────────────────────────────────────────────────
@@ -319,9 +331,6 @@ def serve(path):
         return send_from_directory(app.static_folder, path)
     return send_from_directory(app.template_folder, 'index.html')
 
-
-# Initialise DB at import time so Vercel's WSGI boot picks it up.
-init_db()
 
 if __name__ == '__main__':
     print("Cosmic Q Ops running → http://localhost:5050")
