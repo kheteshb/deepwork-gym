@@ -3,7 +3,6 @@ import os
 from datetime import date, timedelta, datetime
 from pymongo import MongoClient
 from bson import ObjectId
-import certifi
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 app = Flask(
@@ -17,7 +16,7 @@ MONGO_URI = os.environ.get(
     'MONGODB_URI',
     'mongodb+srv://khetesh:cRrQuK1rg8jtlXmE@cluster0.mjow3ex.mongodb.net/?appName=Cluster0'
 )
-_client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
+_client = MongoClient(MONGO_URI, tlsAllowInvalidCertificates=True)
 _db     = _client['cosmicq']
 
 users_col    = _db['users']
