@@ -1,8 +1,9 @@
 from flask import Flask, jsonify, request, send_from_directory
 import os
 from datetime import date, timedelta, datetime
-from pymongo import MongoClient
 from bson import ObjectId
+
+from config.mongo_db import users_col, plans_col, reviews_col, sessions_col
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 app = Flask(
@@ -10,19 +11,6 @@ app = Flask(
     static_folder=os.path.join(_ROOT, 'static'),
     template_folder=os.path.join(_ROOT, 'templates'),
 )
-
-# ── MongoDB connection ────────────────────────────────────────────────────────
-MONGO_URI = os.environ.get(
-    'MONGODB_URI',
-    'mongodb+srv://khetesh:cRrQuK1rg8jtlXmE@cluster0.mjow3ex.mongodb.net/?appName=Cluster0'
-)
-_client = MongoClient(MONGO_URI, tlsAllowInvalidCertificates=True)
-_db     = _client['cosmicq']
-
-users_col    = _db['users']
-plans_col    = _db['plans']
-reviews_col  = _db['reviews']
-sessions_col = _db['sessions']
 
 
 def to_dict(doc):
