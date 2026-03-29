@@ -1,0 +1,9 @@
+node_modules/
+.env
+dist/
+uploads/
+data/
+*.log
+.DS_Store
+frontend/dist/
+__pycache__
